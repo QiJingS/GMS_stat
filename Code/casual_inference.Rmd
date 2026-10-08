@@ -1,0 +1,586 @@
+---
+title: "Causal thinking"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+
+```{css, echo=FALSE}
+.highbox {
+  color: #023103;
+  background-color: #E6F6E6;
+  border: 1px solid #E6F6E6;
+  padding: 12px 15px;
+  border-radius: 4px;
+  text-align: left;
+  margin: 20px 0;
+}
+```
+
+So far we still have many variables we have not used, such as BMI, sex and other covariates. When we study the association between an HLA allele and an HCV phenotype, we need to think carefully about **which covariates to put into the model and which to leave out**. Adding a variable is not always harmless: depending on where it sits in the causal structure, it can remove bias, or it can introduce it.
+
+This session introduces causal thinking through **directed acyclic graphs (DAGs)**. We will draw DAGs with the R package `dagitty`, which can also tell us which variables we should adjust for. Then we will check what the DAGs predict with our own HCV data.
+
+```{r setup, message=FALSE, warning=FALSE}
+# install.packages("dagitty")
+library(dagitty)
+```
+
+We load the data and collect the variables we need in one data frame. Besides HLA-DQB1\*03:01 and viral load, this session uses three variables we have not looked at yet: the liver **fibrosis** score, the patient's genetic **ancestry** (two populations, coded 0/1), and **ALT** (alanine aminotransferase, a blood marker of liver inflammation).
+
+```{r load-data}
+hcv_dataset <- readRDS("hcv_dataset.rds")
+
+hcv <- data.frame(
+  HLA       = hcv_dataset$HLA$HLA_DQB1.03.01,        # copies of DQB1*03:01 (0/1/2)
+  ViralLoad = hcv_dataset$phenotype$viral_load,      # log10 IU/mL
+  Fibrosis  = hcv_dataset$phenotype$fibrosis,        # fibrosis score
+  Ancestry  = hcv_dataset$covariate$ANCESTRY,        # 0/1
+  ALT       = hcv_dataset$covariate$ALT              # IU/L
+)
+head(hcv)
+```
+
+::: {.highbox}
+Some basic probability rules we will use:
+
+- $Var(X) = E[X^2] - (E[X])^2$
+- $Cov(X,Y) = E[XY] - E[X]E[Y]$
+- If $A$ and $B$ are independent, then $P(A, B) = P(A)\,P(B)$.
+
+Notation: $A \perp\!\!\!\perp C \mid B$ means "$A$ is independent of $C$ given $B$".
+:::
+
+# Chain
+
+```{r chain-dag, fig.width=5, fig.height=1.5}
+chain <- dagitty('dag {
+  A [pos="0,0"]
+  B [pos="1,0"]
+  C [pos="2,0"]
+  A -> B -> C
+}')
+plot(chain)
+```
+
+In a chain, once we know $B$, $A$ carries no further information about $C$. In other words, $A$ and $C$ are independent conditional on $B$:
+
+$$
+P(A, C \mid B) = P(A \mid B)\,P(C \mid B)
+$$
+
+Equivalently,
+
+$$
+P(A \mid C, B) = \frac{P(A, C \mid B)}{P(C \mid B)} = P(A \mid B),
+$$
+
+which we write as $A \perp\!\!\!\perp C \mid B$. `dagitty` can list these implied independencies for us:
+
+```{r chain-ci}
+impliedConditionalIndependencies(chain)
+```
+
+When we study the association between $A$ and $C$ without conditioning on $B$, we marginalise over $B$ (i.e. average over all values of $B$ given $A$):
+
+$$
+P(C \mid A) = \sum_b P(C \mid A, b)\,P(b \mid A) = \sum_b P(C \mid b)\,P(b \mid A)
+$$
+
+This form mirrors the chain itself: $A$ informs $B$ (through $P(b \mid A)$), and $B$ informs $C$ (through $P(C \mid b)$).
+
+## A linear example
+
+Suppose the arrows have linear effects:
+
+$$
+A \xrightarrow{\ \alpha\ } B \xrightarrow{\ \beta\ } C
+$$
+
+$$
+B = \alpha A + \epsilon_B, \qquad C = \beta B + \epsilon_C
+$$
+
+If we regress $C$ on $A$ alone, substituting the expression for $B$ gives
+
+$$
+C = \beta(\alpha A + \epsilon_B) + \epsilon_C = \alpha\beta\, A + \underbrace{(\beta\epsilon_B + \epsilon_C)}_{\text{noise}}
+$$
+
+So the coefficient of $A$ is $\alpha\beta$: **$A$ affects $C$ only indirectly, through $B$.** Note what happens if we *also* put $B$ into the regression: the coefficient of $A$ drops to zero, because $B$ already carries all of $A$'s information about $C$.
+
+# Direct and indirect effects (mediation)
+
+Now a slightly more complex situation: $A$ affects $C$ directly, **and** indirectly through $B$. If we change $A$, $C$ changes directly, and also via the change in $B$.
+
+```{r mediation-dag, fig.width=4, fig.height=2.5}
+med <- dagitty('dag {
+  A [exposure, pos="0,0"]
+  B [pos="1,-1"]
+  C [outcome, pos="2,0"]
+  A -> B -> C
+  A -> C
+}')
+plot(med)
+```
+
+$$
+B = \alpha A + \epsilon_B, \qquad C = \gamma A + \beta B + \epsilon_C
+$$
+
+Substituting $B$ again:
+
+$$
+C = \gamma A + \beta(\alpha A + \epsilon_B) + \epsilon_C = \underbrace{\gamma}_{\text{direct}}A + \underbrace{\alpha\beta}_{\text{indirect}}A + \text{noise}
+$$
+
+We get two terms:
+
+- **Direct effect**: $\gamma$ (the path $A \to C$)
+- **Indirect effect**: $\alpha\beta$ (the path $A \to B \to C$)
+- **Total effect**: $\gamma + \alpha\beta$
+
+Which one a regression estimates depends on what we adjust for, and `dagitty` can tell us:
+
+```{r mediation-sets}
+adjustmentSets(med, effect = "total")   # {} : do NOT adjust for B
+adjustmentSets(med, effect = "direct")  # { B }: adjust for B
+```
+
+::: {.highbox}
+**Key message:** a mediator is not a confounder. Adjusting for $B$ removes the indirect path, so `lm(C ~ A + B)` estimates the direct effect $\gamma$, not the total effect. Before putting a covariate into a model, ask where it sits in the DAG.
+:::
+
+## HCV example
+
+In our data:
+
+- $A$: the number of DQB1\*03:01 copies (0/1/2)
+- $B$: HCV viral load (log10 IU/mL)
+- $C$: the liver fibrosis score
+
+The allele may change how well the immune system controls the virus, which lowers viral load and in turn affects fibrosis (indirect path, $A \to B \to C$). The allele may also shape immune-mediated liver inflammation regardless of viral load (direct path, $A \to C$).
+
+```{r hcv-med-dag, fig.width=5, fig.height=2.5}
+hcv_med <- dagitty('dag {
+  HLA [exposure, pos="0,0"]
+  ViralLoad [pos="1,-1"]
+  Fibrosis [outcome, pos="2,0"]
+  HLA -> ViralLoad -> Fibrosis
+  HLA -> Fibrosis
+}')
+plot(hcv_med)
+```
+
+We estimate the three pieces with three regressions. In every model we also adjust for ancestry, because ancestry is a **confounder** of the HLA–fibrosis relationship. We will see why in the fork section below; for now, just keep it in the model.
+
+```{r hcv-mediation}
+fit_total  <- lm(Fibrosis  ~ HLA + Ancestry,             data = hcv)  # total effect
+fit_direct <- lm(Fibrosis  ~ HLA + ViralLoad + Ancestry, data = hcv)  # direct effect (gamma)
+fit_a      <- lm(ViralLoad ~ HLA + Ancestry,             data = hcv)  # alpha
+
+alpha_hat <- coef(fit_a)["HLA"]
+beta_hat  <- coef(fit_direct)["ViralLoad"]
+
+est <- c(
+  total    = unname(coef(fit_total)["HLA"]),
+  direct   = unname(coef(fit_direct)["HLA"]),
+  indirect = unname(alpha_hat * beta_hat)
+)
+round(est, 3)
+```
+
+Each extra copy of DQB1\*03:01 lowers viral load by `r sprintf('%.2f', -alpha_hat)` ($\hat\alpha$), and each unit of viral load raises the fibrosis score by `r sprintf('%.2f', beta_hat)` ($\hat\beta$), so the indirect effect through viral load is $\hat\alpha\hat\beta \approx `r sprintf('%.3f', est["indirect"])`$. The direct effect is `r sprintf('%.3f', est["direct"])`, and together they add up to the total effect: `r sprintf('%.3f', est["direct"])` + (`r sprintf('%.3f', est["indirect"])`) = `r sprintf('%.3f', est["direct"] + est["indirect"])` ≈ `r sprintf('%.3f', est["total"])`.
+
+The same data give two quite different "HLA effects" depending on whether viral load is in the model. In this example most of the allele's effect on fibrosis is direct, and only a small part goes through viral load. Which number we report must follow the causal question we are asking.
+
+# Collider
+
+```{r collider-dag, fig.width=5, fig.height=1.5, message=FALSE}
+collider <- dagitty('dag {
+  A [exposure, pos="0,0"]
+  Z [pos="1,0"]
+  C [outcome, pos="2,0"]
+  A -> Z
+  C -> Z
+}')
+plot(collider)
+```
+
+Here $Z$ is a **common effect** of $A$ and $C$. We assume $A$ and $C$ are independent of each other. However, once we condition on $Z$, $A$ and $C$ become associated.
+
+Since $A$ and $C$ are independent,
+
+$$
+P(A, C) = P(A)\,P(C), \qquad \text{so} \qquad P(C \mid A) = P(C).
+$$
+
+Using Bayes' rule, conditioning on both $A$ and $Z$:
+
+$$
+P(C \mid A, Z) = \frac{P(Z \mid A, C)\,P(C \mid A)}{P(Z \mid A)} = \frac{P(Z \mid A, C)\,P(C)}{P(Z \mid A)}
+$$
+
+and conditioning on $Z$ only:
+
+$$
+P(C \mid Z) = \frac{P(Z \mid C)\,P(C)}{P(Z)}
+$$
+
+Comparing the two, in general
+
+$$
+P(C \mid A, Z) \neq P(C \mid Z).
+$$
+
+The two would only be equal if $Z$ depended on $C$ alone: then $P(Z \mid A, C) = P(Z \mid C)$ and $P(Z \mid A) = P(Z)$. But $Z$ has two sources, $A$ **and** $C$, so once $Z$ is known, knowing $A$ changes what we believe about $C$. In other words, **given $Z$, $A$ and $C$ become associated**, even though neither causes the other.
+
+Intuition ("explaining away"): if $Z$ is high, it must be because $A$ is high or $C$ is high. If we know $Z$ is high and $A$ is low, then $C$ is probably high. So among people with the same $Z$, $A$ and $C$ appear negatively related.
+
+`dagitty` confirms this: to estimate the effect of $A$ on $C$, the adjustment set is empty, i.e. we should **not** put $Z$ into the regression.
+
+```{r collider-sets}
+adjustmentSets(collider)
+```
+
+::: {.highbox}
+**Checking with covariances**
+
+Suppose the relationship is
+
+$$
+A \xrightarrow{\ \alpha\ } Z \xleftarrow{\ \beta\ } C, \qquad Z = \alpha A + \beta C + \epsilon_Z
+$$
+
+and we (wrongly) put $Z$ into the regression:
+
+$$
+C = \gamma_0 + \gamma_A A + \gamma_Z Z + \epsilon
+$$
+
+We want to know whether the new coefficient $\gamma_A$ is still $0$. For simplicity, assume all variables are standardised, $Var(A) = Var(C) = Var(Z) = 1$, and since $A$ and $C$ are independent, $Cov(A, C) = 0$.
+
+The covariances we need are:
+
+$$
+Cov(A, Z) = Cov(A,\ \alpha A + \beta C + \epsilon_Z) = \alpha\,Var(A) = \alpha
+$$
+
+$$
+Cov(C, Z) = Cov(C,\ \alpha A + \beta C + \epsilon_Z) = \beta\,Var(C) = \beta
+$$
+
+Taking the covariance of both sides of the regression equation with $A$ and with $Z$:
+
+$$
+Cov(A, C) = \gamma_A Var(A) + \gamma_Z Cov(A, Z) \;\Rightarrow\; 0 = \gamma_A + \alpha\gamma_Z
+$$
+
+$$
+Cov(Z, C) = \gamma_A Cov(A, Z) + \gamma_Z Var(Z) \;\Rightarrow\; \beta = \alpha\gamma_A + \gamma_Z
+$$
+
+From the first equation, $\gamma_A = -\alpha\gamma_Z$. Substituting into the second gives $\beta = \gamma_Z(1 - \alpha^2)$, so
+
+$$
+\gamma_Z = \frac{\beta}{1 - \alpha^2}, \qquad \gamma_A = -\frac{\alpha\beta}{1 - \alpha^2}
+$$
+
+So $\gamma_A$ should be $0$, but by adjusting for $Z$ we created an association of $-\alpha\beta/(1-\alpha^2)$. Whenever $\alpha$ and $\beta$ are both non-zero, conditioning on the collider introduces bias.
+:::
+
+::: {.highbox}
+**Key message:** a collider path is **closed** by default. Adjusting for a collider (or restricting the sample by it) **opens** the path and creates bias. More covariates is not always better.
+:::
+
+## HCV example
+
+Suppose we want to know whether DQB1\*03:01 affects HCV viral load, and we think "liver inflammation (ALT) is an important covariate, let's add it". But ALT is raised both by HLA-driven immune responses and by liver damage, which in turn is driven by viral load (through fibrosis):
+
+```{r hcv-collider-dag, fig.width=6, fig.height=2.5}
+hcv_col <- dagitty('dag {
+  HLA [exposure, pos="0,0"]
+  ViralLoad [outcome, pos="2,0"]
+  Fibrosis [pos="2,-1"]
+  ALT [pos="1,-1"]
+  HLA -> ViralLoad
+  HLA -> ALT
+  HLA -> Fibrosis
+  ViralLoad -> Fibrosis -> ALT
+}')
+plot(hcv_col)
+adjustmentSets(hcv_col)   # {} : do NOT adjust for ALT
+```
+
+ALT is a collider on the path $\text{HLA} \to \text{ALT} \leftarrow \text{Fibrosis} \leftarrow \text{Viral load}$. `dagitty` says we should not adjust for it. Let's see what happens if we do:
+
+```{r hcv-collider}
+round(c(
+  unadjusted   = unname(coef(lm(ViralLoad ~ HLA,       data = hcv))["HLA"]),
+  adjusted_ALT = unname(coef(lm(ViralLoad ~ HLA + ALT, data = hcv))["HLA"])
+), 3)
+```
+
+Without ALT, the estimate is the effect we found in the linear regression session. Adding ALT roughly **doubles** it. Nothing about the allele has changed; we have simply opened a non-causal path. Among patients with the same ALT, those who carry DQB1\*03:01 (which raises ALT) must have less liver damage, and therefore lower viral load, to end up at the same ALT. That "explaining away" makes the allele look more protective than it really is.
+
+# Fork (confounder)
+
+```{r fork-dag, fig.width=5, fig.height=1.5, message=FALSE}
+fork <- dagitty('dag {
+  A [exposure, pos="0,0"]
+  B [pos="1,0"]
+  C [outcome, pos="2,0"]
+  B -> A
+  B -> C
+}')
+plot(fork)
+```
+
+Here $B$ is a **common cause** of $A$ and $C$. Even if $A$ has no effect on $C$, the two will be associated, because both receive information from $B$. But **given $B$, $A$ and $C$ are independent**.
+
+The DAG factorises as
+
+$$
+P(A, B, C) = P(B)\,P(A \mid B)\,P(C \mid B)
+$$
+
+so, conditioning on $B$:
+
+$$
+P(A, C \mid B) = \frac{P(A, B, C)}{P(B)} = \frac{P(B)\,P(A \mid B)\,P(C \mid B)}{P(B)} = P(A \mid B)\,P(C \mid B)
+$$
+
+Equivalently,
+
+$$
+P(C \mid A, B) = \frac{P(A, C \mid B)}{P(A \mid B)} = P(C \mid B)
+$$
+
+This tells us that once $B$ is known, $A$ carries no further information about $C$: $A \perp\!\!\!\perp C \mid B$.
+
+Without conditioning on $B$, however, $A$ and $C$ are **not** independent:
+
+$$
+P(A, C) = \sum_b P(b)\,P(A \mid b)\,P(C \mid b) \neq P(A)\,P(C)
+$$
+
+The path $A \leftarrow B \to C$ is called a **backdoor path**: it links $A$ and $C$ without going through any arrow out of $A$. So when we analyse the association between $A$ and $C$, we **should include $B$** in the model. `dagitty` agrees:
+
+```{r fork-sets}
+impliedConditionalIndependencies(fork)  # A _||_ C | B
+adjustmentSets(fork)                    # { B }
+```
+
+::: {.highbox}
+**Checking with covariances**
+
+Suppose the relationship is
+
+$$
+A \xleftarrow{\ \alpha\ } B \xrightarrow{\ \beta\ } C, \qquad A = \alpha B + \epsilon_A, \qquad C = \beta B + \epsilon_C
+$$
+
+with no arrow from $A$ to $C$. Again assume all variables are standardised, $Var(A) = Var(B) = Var(C) = 1$. The covariances are:
+
+$$
+Cov(A, B) = \alpha, \qquad Cov(C, B) = \beta
+$$
+
+$$
+Cov(A, C) = Cov(\alpha B + \epsilon_A,\ \beta B + \epsilon_C) = \alpha\beta\,Var(B) = \alpha\beta
+$$
+
+**Without $B$**: $C = \gamma_0 + \gamma_A A + \epsilon$ gives
+
+$$
+\gamma_A = \frac{Cov(A, C)}{Var(A)} = \alpha\beta \neq 0
+$$
+
+a spurious association, although $A$ has no effect on $C$.
+
+**With $B$**: $C = \gamma_0 + \gamma_A A + \gamma_B B + \epsilon$. Taking covariances with $A$ and with $B$:
+
+$$
+Cov(A, C) = \gamma_A + \gamma_B Cov(A, B) \;\Rightarrow\; \alpha\beta = \gamma_A + \alpha\gamma_B
+$$
+
+$$
+Cov(B, C) = \gamma_A Cov(A, B) + \gamma_B \;\Rightarrow\; \beta = \alpha\gamma_A + \gamma_B
+$$
+
+From the second equation, $\gamma_B = \beta - \alpha\gamma_A$. Substituting into the first:
+
+$$
+\alpha\beta = \gamma_A + \alpha\beta - \alpha^2\gamma_A \;\Rightarrow\; \gamma_A(1 - \alpha^2) = 0 \;\Rightarrow\; \gamma_A = 0, \quad \gamma_B = \beta
+$$
+
+So adjusting for the confounder removes the spurious association. This is the exact opposite of the collider, where adjusting **created** one.
+:::
+
+::: {.highbox}
+**Key message:** a confounder opens a backdoor path. Adjusting for it **closes** the path and removes the bias. This is the classic reason we "adjust for covariates".
+:::
+
+## HCV example
+
+For a germline HLA allele, very few things can cause $A$: the genotype is fixed at conception. Sex, BMI or alcohol use cannot change which HLA alleles someone carries, so they **cannot be confounders** of the HLA effect (they can still be useful to explain outcome variance). The main confounder is **genetic ancestry**: HLA allele frequencies differ between populations, and ancestry is also linked to HCV outcomes through other genetic and environmental factors. This is why genetic association studies adjust for ancestry, usually with genetic principal components.
+
+```{r hcv-fork-dag, fig.width=5, fig.height=2}
+hcv_fork <- dagitty('dag {
+  HLA [exposure, pos="0,0"]
+  Ancestry [pos="1,-1"]
+  Fibrosis [outcome, pos="2,0"]
+  Ancestry -> HLA
+  Ancestry -> Fibrosis
+  HLA -> Fibrosis
+}')
+plot(hcv_fork)
+```
+
+In our data, DQB1\*03:01 is much more common in one population, and that population also has higher fibrosis scores:
+
+```{r hcv-fork-describe}
+# allele frequency of DQB1*03:01 in each population
+tapply(hcv$HLA, hcv$Ancestry, mean) / 2
+
+# mean fibrosis score in each population
+tapply(hcv$Fibrosis, hcv$Ancestry, mean)
+```
+
+So a crude comparison of fibrosis between carriers and non-carriers mixes up the allele effect with the ancestry difference:
+
+```{r hcv-fork}
+crude    <- unname(coef(lm(Fibrosis ~ HLA,            data = hcv))["HLA"])
+adjusted <- unname(coef(lm(Fibrosis ~ HLA + Ancestry, data = hcv))["HLA"])
+round(c(crude = crude, adjusted = adjusted), 3)
+```
+
+The crude estimate (`r sprintf('%.2f', crude)`) is much closer to zero than the adjusted one (`r sprintf('%.2f', adjusted)`). Carriers are more often from the population with higher fibrosis, which pushes their fibrosis scores up and hides most of the protective effect of the allele. Adjusting for ancestry closes the backdoor path and reveals the allele's effect. This is why we kept ancestry in the mediation models above.
+
+# Putting it together
+
+Real problems rarely contain just one chain, fork or collider. Consider five variables, where we want the effect of the exposure $A$ on the outcome $E$:
+
+```{r big-dag, fig.width=5, fig.height=3.5, message=FALSE}
+dag5 <- dagitty('dag {
+  A [exposure, pos="0,0"]
+  E [outcome,  pos="2,0"]
+  B [pos="1,-1.5"]
+  C [pos="1,-0.6"]
+  D [pos="1,1"]
+  B -> A
+  B -> E
+  A -> C -> E
+  A -> E
+  A -> D
+  E -> D
+}')
+plot(dag5)
+```
+
+The arrows are:
+
+$$
+B \to A, \quad B \to E, \quad A \to C \to E, \quad A \to E, \quad A \to D \leftarrow E
+$$
+
+This is exactly the structure of our HCV variables: $A$ = DQB1\*03:01, $B$ = ancestry, $C$ = viral load, $D$ = ALT, $E$ = fibrosis.
+
+## Step 1: list every path between A and E
+
+```{r dag5-paths}
+paths(dag5, "A", "E")
+```
+
+There are four paths:
+
+| Path | Type | Role of the middle variable | Open by default? |
+|---|---|---|---|
+| $A \to E$ | causal (direct) | none | open |
+| $A \to C \to E$ | causal (indirect) | $C$ is a **mediator** (chain) | open |
+| $A \leftarrow B \to E$ | backdoor | $B$ is a **confounder** (fork) | open |
+| $A \to D \leftarrow E$ | non-causal | $D$ is a **collider** | closed |
+
+The two causal paths carry the effect we want. The backdoor path through $B$ carries bias and must be **closed**. The path through $D$ is already closed and must be **left alone**.
+
+## Step 2: decide what to adjust for
+
+This depends on the question:
+
+- **Total effect** of $A$ on $E$ (both causal paths): adjust for $B$ only. Do not adjust for $C$ (it would block the indirect path) or $D$ (it would open the collider path).
+- **Direct effect** of $A$ on $E$ (only $A \to E$): adjust for $B$ and $C$, still not $D$.
+
+`dagitty` gives the same answer:
+
+```{r dag5-sets}
+adjustmentSets(dag5, effect = "total")   # { B }
+adjustmentSets(dag5, effect = "direct")  # { B, C }
+```
+
+We can also check which paths stay open under a given adjustment set:
+
+```{r dag5-open}
+paths(dag5, "A", "E", Z = "B")$open          # backdoor closed, causal paths open
+paths(dag5, "A", "E", Z = c("B", "D"))$open  # adjusting D re-opens A -> D <- E
+```
+
+A useful rule of thumb comes out of this: **for the total effect, never adjust for a descendant of the exposure**. `dagitty` lists them:
+
+```{r dag5-desc}
+descendants(dag5, "A")  # A itself, C, D, E
+```
+
+$C$ and $D$ are both descendants of $A$, so neither belongs in the total-effect model, for different reasons ($C$ is a mediator, $D$ is a collider).
+
+## Step 3: check the DAG against the data
+
+The DAG implies testable independencies:
+
+```{r dag5-ci}
+impliedConditionalIndependencies(dag5)
+```
+
+For example, $B \perp\!\!\!\perp C \mid A$: once we know a patient's DQB1\*03:01 genotype, their ancestry tells us nothing more about their viral load. We can test each statement with a regression: if the DAG is right, the coefficient of the first variable should be close to zero after adjusting for the variables after the "|".
+
+```{r dag5-test}
+p_value <- function(fit, term) summary(fit)$coefficients[term, 4]
+
+round(c(
+  "B _||_ C | A"    = p_value(lm(ViralLoad ~ Ancestry  + HLA,            data = hcv), "Ancestry"),
+  "B _||_ D | A, E" = p_value(lm(ALT       ~ Ancestry  + HLA + Fibrosis, data = hcv), "Ancestry"),
+  "C _||_ D | A, E" = p_value(lm(ALT       ~ ViralLoad + HLA + Fibrosis, data = hcv), "ViralLoad")
+), 3)
+```
+
+None of the p-values is small, so the data are consistent with the DAG. (A clearly small p-value would tell us that the DAG is missing an arrow.) Note that this kind of check can only *reject* a DAG; it can never prove that a DAG is correct.
+
+## Step 4: see the consequences in our data
+
+Now we fit the four models for the effect of DQB1\*03:01 on fibrosis:
+
+```{r dag5-models}
+models <- list(
+  "E ~ A"         = lm(Fibrosis ~ HLA,                       data = hcv),
+  "E ~ A + B"     = lm(Fibrosis ~ HLA + Ancestry,            data = hcv),
+  "E ~ A + B + C" = lm(Fibrosis ~ HLA + Ancestry + ViralLoad, data = hcv),
+  "E ~ A + B + D" = lm(Fibrosis ~ HLA + Ancestry + ALT,      data = hcv)
+)
+dag5_est <- sapply(models, function(m) unname(coef(m)["HLA"]))
+round(dag5_est, 3)
+```
+
+Because these data were simulated for teaching, we know the true effects: a direct effect of DQB1\*03:01 on fibrosis of $-0.30$, plus a small indirect effect through viral load (about `r sprintf('%.2f', est["indirect"])`), so a total effect of about `r sprintf('%.2f', -0.30 + est["indirect"])`.
+
+| Model | Estimate of $A$ | Interpretation |
+|---|---|---|
+| $E \sim A$ | `r sprintf('%.2f', dag5_est[1])` | biased: backdoor via ancestry ($B$) is open |
+| $E \sim A + B$ | `r sprintf('%.2f', dag5_est[2])` | **total effect** (correct) |
+| $E \sim A + B + C$ | `r sprintf('%.2f', dag5_est[3])` | **direct effect** (correct) |
+| $E \sim A + B + D$ | `r sprintf('%.2f', dag5_est[4])` | biased: collider ALT ($D$) opened a spurious path |
+
+::: {.highbox}
+**Key message:** the same data give four different "effects of DQB1\*03:01 on fibrosis" depending on the covariates. Only the DAG tells us which model answers which question. Draw the DAG first, then let it (or `dagitty`) choose the adjustment set.
+:::

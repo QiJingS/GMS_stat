@@ -1,0 +1,579 @@
+---
+title: "Regularised regression"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+
+```{css, echo=FALSE}
+.highbox {
+  color: #023103;
+  background-color: #E6F6E6;
+  border: 1px solid #E6F6E6;
+  padding: 12px 15px;
+  border-radius: 4px;
+  text-align: left;
+  margin: 20px 0;
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 7, fig.height = 4.5)
+fmt_p <- function(p) if (p < 0.001) sprintf("%.1e", p) else sprintf("%.2f", p)   # p-values in the text
+```
+
+In the last two sessions we asked whether **one** HLA allele, DQB1\*03:01, is associated with viral load (linear regression) and with cirrhosis (logistic regression). But our dataset contains many HLA alleles, and we do not know in advance which of them matter.
+
+::: {.highbox}
+**Question:** Which HLA alleles are associated with viral load? and when several of them light up together, how do we tell which one is really driving the signal?
+:::
+
+We will use some packages that are new in this session (`forestplot` and, later, `brms`). If they are missing, install them first with `install.packages()`.
+
+```{r libraries}
+library(ggplot2)
+library(dplyr)
+library(forestplot)
+```
+
+# Load the data
+
+```{r load-data}
+hcv_dataset <- readRDS("hcv_dataset.rds")
+HLA_alleles <- hcv_dataset$HLA
+pheno       <- hcv_dataset$phenotype
+covar       <- hcv_dataset$covariate
+
+alleles <- setdiff(names(HLA_alleles), "ID")   # HLA columns only, without the ID
+length(alleles)
+
+dat <- data.frame(
+  viral_load = pheno$viral_load,
+  cirrhosis  = as.integer(pheno$cirrhosis == "Yes"),   # 1 = Yes, 0 = No
+  covar,
+  HLA_alleles[, alleles]
+)
+```
+
+We adjust for age, sex and BMI throughout. They cannot confound a germline HLA allele (see the causal thinking session), but they are strong predictors of viral load. Including them removes part of the noise in the outcome, so the allele effects are estimated more precisely.
+
+# Marginal regression: testing every allele, one at a time
+
+In the linear regression session we tested the association between DQB1\*03:01 and viral load. Now we do the same for every other allele: for each one, we fit a model and keep $\hat\beta_1$, its standard error and its p-value. Each model looks at **one allele at a time**, so this is called a **marginal** analysis.
+
+::: {.highbox}
+**Code tips:** we want to fit the same model `r length(alleles)` times, changing only the allele.
+
+- A `for` loop does this one allele at a time and stores each result. `sapply()` does the same thing in one line: it runs a function on every element of `alleles` and collects the results.
+- `reformulate(c(a, "AGE", "SEX", "BMI"), "viral_load")` builds the formula `viral_load ~ HLA_xxx + AGE + SEX + BMI` from the allele name `a`.
+- `summary(fit)$coefficients[a, ]` keeps only the row of the coefficient table that belongs to the allele: estimate, SE, t value and p-value.
+:::
+
+```{r marginal-scan}
+scan <- t(sapply(alleles, function(a)
+  summary(lm(reformulate(c(a, "AGE", "SEX", "BMI"), "viral_load"),
+             data = dat))$coefficients[a, ]))
+```
+
+`sapply()` returns one column per allele, so `t()` flips it to one row per allele. Let's tidy the result and look at the strongest associations:
+
+```{r marginal-top}
+scan.vl <- data.frame(allele = rownames(scan),
+                      beta = scan[, 1], se = scan[, 2], pval = scan[, 4],
+                      row.names = NULL)
+head(arrange(scan.vl, pval))
+```
+
+## Forest plot
+
+A table of `r length(alleles)` rows is hard to read. A **forest plot** puts all the estimates in one picture. Each row is an allele, the box is its estimate $\hat\beta$ and the horizontal line is its 95% confidence interval. You can draw a forest plot with `ggplot2` or base R, but the [`forestplot`](https://cran.r-project.org/web/packages/forestplot/vignettes/forestplot.html) package is convenient: it draws the intervals and prints the estimate, CI and p-value as a table alongside them.
+
+First we add the columns the plot needs. With `r length(alleles)` tests, the Bonferroni threshold is $0.05 / `r length(alleles)` \approx `r signif(0.05 / length(alleles), 2)`$, and we mark the alleles that pass it with `*`.
+
+```{r plot-columns}
+alpha_bonf <- 0.05 / length(alleles)
+
+# "HLA_DQB1.03.01" -> "DQB1*03:01"
+allele_label <- function(a) sub("^HLA_([A-Z0-9]+)\\.(\\d+)\\.(\\d+)$", "\\1*\\2:\\3", a)
+
+add_plot_columns <- function(scan_df) {
+  scan_df %>%
+    mutate(lower = beta - 1.96 * se,
+           upper = beta + 1.96 * se,
+           label = allele_label(allele),
+           locus = sub("\\*.*", "", label),
+           p_txt = paste0(formatC(pval, format = "e", digits = 1),
+                          ifelse(pval < alpha_bonf, " *", "  "))) %>%
+    arrange(factor(locus, levels = c("A", "C", "B", "DRB1", "DQA1", "DQB1", "DPA1")),
+            label)   # order rows by position along the HLA region
+}
+
+scan.vl <- add_plot_columns(scan.vl)
+```
+
+We will draw several forest plots in this session, so we wrap the plotting code in a small function. `labeltext` lists the text columns, `mean`, `lower` and `upper` give the box and the line, and `zero` is where the reference line goes.
+
+```{r plot-forest-function}
+plot_forest <- function(scan_df, est_name = "Beta", zero = 0, xlog = FALSE,
+                        xticks = NULL, xlab = "Effect per allele copy (95% CI)") {
+  scan_df %>%
+    mutate(est_txt = sprintf("%.2f (%.2f, %.2f)", mean, lower, upper)) %>%
+    forestplot(labeltext = c(label, est_txt, p_txt),
+               mean = mean, lower = lower, upper = upper,
+               zero = zero, xlog = xlog, xticks = xticks, xlab = xlab,
+               boxsize = 0.3, lineheight = unit(0.6, "cm"),
+               txt_gp = fpTxtGp(label = gpar(cex = 0.75),
+                                ticks = gpar(cex = 0.75),
+                                xlab  = gpar(cex = 0.85))) %>%
+    fp_add_header(label = "Allele", est_txt = paste(est_name, "(95% CI)"),
+                  p_txt = "P value") %>%
+    fp_set_style(box = "#2166AC", line = "#2166AC") %>%
+    fp_set_zebra_style("#F2F2F2")
+}
+```
+
+```{r forest-vl, fig.width = 8, fig.height = 10}
+scan.vl %>%
+  mutate(mean = beta) %>%
+  plot_forest(xticks = seq(-0.2, 0.2, by = 0.1),
+              xlab = "Change in log10 viral load per allele copy (95% CI)")
+```
+
+```{r n-bonferroni}
+sum(scan.vl$pval < alpha_bonf)
+```
+
+`r sum(scan.vl$pval < alpha_bonf)` of the `r length(alleles)` alleles pass the Bonferroni threshold, and most of them are in the class II region (DRB1, DQA1, DQB1). DQB1\*03:01 is the strongest signal, but DQA1\*05:05, an allele from the neighbouring DQA1 gene, also comes out clearly: each copy goes with a `r sprintf('%.3f', scan.vl$beta[scan.vl$allele == "HLA_DQA1.05.05"])` change in log10 viral load ($p =$ `r fmt_p(scan.vl$pval[scan.vl$allele == "HLA_DQA1.05.05"])`).
+
+::: {.highbox}
+**Question:** Have we found two independent alleles that lower viral load? Do we really have `r sum(scan.vl$pval < alpha_bonf)` separate effects?
+:::
+
+# Are both signals real? Linkage disequilibrium
+
+Let's look at how often DQB1\*03:01 and DQA1\*05:05 occur together in the same patients:
+
+```{r ld-table}
+table(DQB1_03_01 = dat$HLA_DQB1.03.01, DQA1_05_05 = dat$HLA_DQA1.05.05)
+```
+
+Almost everyone who carries DQB1\*03:01 also carries DQA1\*05:05, usually in the same number of copies. (The reverse is not true: many patients carry DQA1\*05:05 without DQB1\*03:01.) The two alleles are far from independent.
+
+::: {.highbox}
+**Linkage disequilibrium (LD).** HLA-DQA1 and HLA-DQB1 sit right next to each other on chromosome 6. Neighbouring alleles are inherited together as a block (a *haplotype*), because recombination between them is rare.
+:::
+
+We measure LD with the correlation between allele dosages, $r$, or its square $r^2$:
+
+```{r ld-r}
+r <- cor(dat$HLA_DQB1.03.01, dat$HLA_DQA1.05.05)
+c(r = r, r2 = r^2)
+```
+
+- $r^2 = 0$: knowing one allele tells you nothing about the other.
+- $r^2 = 1$: the two alleles are perfect proxies for each other.
+
+Here $r^2 \approx `r round(r^2, 2)`$, so about `r round(100 * r^2)`% of the variation in one allele's dosage is explained by the other. LD is everywhere in the HLA region. Correlating all pairs of alleles shows strong blocks, especially inside the class II region (DRB1, DQA1, DQB1):
+
+```{r ld-heatmap, fig.width = 8, fig.height = 7, class.source = "fold-hide"}
+ld  <- cor(dat[, alleles])
+lab <- allele_label(alleles)
+ld_long <- data.frame(a  = factor(rep(lab, times = length(lab)), levels = lab),
+                      b  = factor(rep(lab, each  = length(lab)), levels = rev(lab)),
+                      r2 = as.vector(ld^2))
+
+ggplot(ld_long, aes(a, b, fill = r2)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "#B2182B", limits = c(0, 1)) +
+  labs(x = NULL, y = NULL, fill = expression(r^2), title = "LD between HLA alleles") +
+  coord_fixed() +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        panel.grid = element_blank())
+```
+
+## Why does LD matter?
+
+Each test in our scan looked at one allele alone. If DQB1\*03:01 truly lowers viral load, then DQA1\*05:05 will also look associated, simply because it is carried by the same people. It is the same picture as the fork in the causal thinking session:
+
+$$
+\text{DQA1*05:05} \;\leftarrow\; \text{haplotype} \;\rightarrow\; \text{DQB1*03:01} \;\rightarrow\; \text{viral load}
+$$
+
+
+> **Key message:** a significant marginal association means the allele *tags* the signal, not that it *causes* it. In a region with strong LD, one real signal can produce many significant alleles.
+
+## Fitting them jointly
+
+If we put both alleles in the same model, each coefficient becomes the effect of that allele *holding the other fixed*. This is the same logic as adjusting for a confounder:
+
+```{r joint2}
+joint2 <- lm(viral_load ~ HLA_DQB1.03.01 + HLA_DQA1.05.05 + AGE + SEX + BMI,
+             data = dat)
+round(summary(joint2)$coefficients[2:3, ], 3)
+```
+
+```{r joint2-values, echo=FALSE}
+jc <- summary(joint2)$coefficients
+mg <- scan.vl[match(c("HLA_DQB1.03.01", "HLA_DQA1.05.05"), scan.vl$allele), ]
+```
+
+The picture changes completely. DQB1\*03:01 keeps a clear effect (`r sprintf('%.3f', jc["HLA_DQB1.03.01", 1])`, $p =$ `r fmt_p(jc["HLA_DQB1.03.01", 4])`), whereas DQA1\*05:05 drops to `r sprintf('%.3f', jc["HLA_DQA1.05.05", 1])` and is no longer significant ($p =$ `r fmt_p(jc["HLA_DQA1.05.05", 4])`). Once we know how many copies of DQB1\*03:01 a patient carries, DQA1\*05:05 adds no further information: it was a passenger (explanation 1). The patients who carry DQA1\*05:05 *without* DQB1\*03:01 are what make this separation possible.
+
+The price of fitting both is precision. The standard errors grow from `r sprintf('%.3f', mg$se[1])` and `r sprintf('%.3f', mg$se[2])` in the marginal models to `r sprintf('%.3f', jc["HLA_DQB1.03.01", 2])` and `r sprintf('%.3f', jc["HLA_DQA1.05.05", 2])`, because correlated predictors compete to explain the same variation. This is called **collinearity**, and the **variance inflation factor (VIF)** tells us how much the variance grows:
+
+$$
+\text{VIF} = \frac{1}{1 - r^2} = \frac{1}{1 - `r round(r^2, 2)`} \approx `r round(1 / (1 - r^2), 1)`
+\qquad\Rightarrow\qquad \text{SE grows by } \sqrt{\text{VIF}} \approx `r round(sqrt(1 / (1 - r^2)), 2)`
+$$
+
+So should we just put **all** `r length(alleles)` alleles into one model? Let's try:
+
+```{r full-model}
+full <- lm(reformulate(c(alleles, "AGE", "SEX", "BMI"), "viral_load"), data = dat)
+full_coef <- summary(full)$coefficients
+round(full_coef[c("HLA_DQB1.03.01", "HLA_DQA1.05.05"), ], 3)
+```
+
+It gets worse. The standard error of DQB1\*03:01 is now `r sprintf('%.3f', full_coef["HLA_DQB1.03.01", 2])`, more than three times larger than in the marginal scan, and the allele is no longer significant ($p =$ `r fmt_p(full_coef["HLA_DQB1.03.01", 4])`), even though it is the strongest signal in the data. Alleles at the same locus are constrained (each person carries exactly two alleles per gene), and many alleles are in LD with several others. With so many correlated predictors, ordinary least squares (or maximum likelihood) gives imprecise, unstable estimates that would move a lot with small changes to the data. We need a way to fit many correlated predictors at once **and keep the estimates under control**.
+
+# Regularised regression
+
+Separating correlated signals in an LD region is called **fine-mapping**. Specialised methods exist for it, for example a stochastic search over candidate causal configurations (FINEMAP) or the "sum of single effects" model (SuSiE). In this session we use a simpler and very general tool, **regularised (penalised) regression**. It is easiest to understand from a Bayesian point of view.
+
+## A Bayesian view: adding prior knowledge
+
+Everything so far has been *frequentist*: the coefficients $\beta_j$ are fixed unknown numbers, and we estimate them by maximising the likelihood, i.e. by choosing the $\beta$ that make the observed data most probable. In the *Bayesian* approach we also treat $\beta_j$ as uncertain, and describe our belief about it **before** seeing the data with a *prior distribution* $p(\beta)$. Bayes' rule then combines the prior with the data:
+
+$$
+\underbrace{p(\beta \mid \text{data})}_{\text{posterior}} \;\propto\;
+\underbrace{p(\text{data} \mid \beta)}_{\text{likelihood}} \times
+\underbrace{p(\beta)}_{\text{prior}}
+$$
+
+What do we know before looking at our data? From the literature on HLA and disease, we expect that **only a few alleles truly affect a given phenotype, and most have little or no effect**. A reasonable prior therefore says: *each allele's effect is probably zero or very close to zero, unless the data give strong evidence otherwise.*
+
+A distribution that expresses this belief is the **Laplace** (or **double-exponential**) distribution, which is two exponential distributions placed back to back around zero:
+
+$$
+p(\beta_j) = \frac{1}{2b}\exp\!\left(-\frac{|\beta_j|}{b}\right)
+$$
+
+The scale $b$ controls how strongly we believe the effects are small: the smaller $b$, the more tightly the prior is concentrated around zero. Let's compare it with a normal distribution with the same variance:
+
+```{r laplace-prior, fig.width = 7, fig.height = 4}
+dlaplace <- function(x, b = 1) exp(-abs(x) / b) / (2 * b)
+
+b <- 1 / sqrt(2)                       # Laplace variance = 2 b^2 = 1
+beta_grid <- seq(-4, 4, length.out = 801)
+prior_long <- data.frame(
+  beta    = rep(beta_grid, 2),
+  density = c(dlaplace(beta_grid, b), dnorm(beta_grid, 0, 1)),
+  prior   = rep(c("Laplace (lasso)", "Normal (ridge)"), each = length(beta_grid))
+)
+
+ggplot(prior_long, aes(beta, density, colour = prior)) +
+  geom_line(linewidth = 1) +
+  scale_colour_manual(values = c("#B2182B", "#2166AC")) +
+  labs(x = expression(beta[j]), y = "Prior density", colour = NULL,
+       title = "Two priors with the same variance") +
+  theme_minimal()
+```
+
+Compared with the normal prior, the Laplace prior has a **sharp peak at exactly zero** and **heavier tails**. It puts a lot of probability on effects that are zero or close to zero, but still allows a few effects to be large. This is exactly what we believe about HLA alleles.
+
+We now fit **one joint model with all alleles**:
+
+$$
+\text{VL}_i = \beta_0 + \beta_1 x_{i1} + \dots + \beta_p x_{ip} + \gamma^\top z_i + \varepsilon_i,
+\qquad \varepsilon_i \sim N(0, \sigma^2)
+$$
+
+Here $x_{ij}$ is the number of copies of allele $j$ carried by patient $i$, and $z_i$ holds the covariates (age, sex, BMI). Every allele effect gets the same independent prior, $\beta_j \sim \text{Laplace}(0, b)$. The intercept and covariates get no prior (a flat prior), because we do not want to shrink them. Taking the log of Bayes' rule gives
+
+$$
+\log p(\beta \mid \text{data}) =
+\underbrace{\ell(\beta)}_{\text{log-likelihood}}
+\;\underbrace{-\;\frac{1}{b}\sum_{j=1}^{p}|\beta_j|}_{\text{log-prior}}
+\;+\; \text{constant}.
+$$
+
+This is exactly the **lasso** objective: the log-likelihood minus a penalty on the sum of the absolute effects. The posterior mode (the *maximum a posteriori*, or MAP, estimate) under a Laplace prior is the lasso estimate. Similarly, a normal prior gives a penalty on $\sum_j \beta_j^2$, which is **ridge** regression.
+
+## Prior × likelihood = posterior, by hand
+
+Before using a package, we write the two ingredients of Bayes' rule ourselves and find the posterior mode with `optim()`. To keep the example small enough to see, we use only the two alleles from the LD example, DQB1\*03:01 and DQA1\*05:05, plus the covariates, and a linear model for viral load.
+
+**The data.** We keep patients with complete covariates, and scale the covariates so that they are on a similar scale:
+
+```{r small-data}
+focus <- c("HLA_DQB1.03.01", "HLA_DQA1.05.05")
+dd0   <- na.omit(dat[, c("viral_load", "AGE", "SEX", "BMI", focus)])
+
+Y  <- dd0$viral_load
+Xc <- scale(model.matrix(~ AGE + SEX + BMI, data = dd0)[, -1])  # covariates (no prior)
+X  <- cbind(Xc, as.matrix(dd0[, focus]))                       # + alleles (Laplace prior)
+penalised <- colnames(X) %in% focus                            # which columns get the prior
+```
+
+**The likelihood.** For a linear model with normal errors, $Y_i \sim N(\beta_0 + x_i^\top\beta,\ \sigma^2)$, the log-likelihood is
+
+$$
+\ell(\beta) = -\frac{n}{2}\log(2\pi\sigma^2) - \frac{1}{2\sigma^2}\sum_{i=1}^{n}\big(y_i - \beta_0 - x_i^\top\beta\big)^2
+$$
+
+```{r likelihood-function}
+likelihood_linear <- function(Y, X, parameters, sigma2 = 1) {
+  n     <- length(Y)
+  beta0 <- parameters[1]
+  beta  <- parameters[-1]
+  residuals <- Y - (beta0 + X %*% beta)
+  -0.5 * n * log(2 * pi * sigma2) - sum(residuals^2) / (2 * sigma2)
+}
+```
+
+**The residual variance.** To keep things simple we treat $\sigma^2$ as known, and estimate it from the ordinary least-squares (OLS) fit:
+
+$$
+\hat\beta_{\text{OLS}} = (X^\top X)^{-1} X^\top Y,
+\qquad
+\hat\sigma^2 = \frac{1}{n - p - 1}\sum_{i=1}^{n}\left(y_i - \hat y_i\right)^2,
+$$
+
+where $X$ includes a column of 1s for the intercept, and $n - p - 1$ is the residual degrees of freedom ($p$ being the number of predictors, not counting the intercept).
+
+```{r sigma2}
+X1 <- cbind(1, X)                                  # add the intercept column
+beta_ols  <- solve(t(X1) %*% X1, t(X1) %*% Y)      # (X'X)^{-1} X'Y
+residuals <- Y - X1 %*% beta_ols
+sigma2    <- sum(residuals^2) / (length(Y) - ncol(X1))
+
+# check against lm()
+c(by_hand = sigma2, lm = summary(lm(Y ~ X))$sigma^2)
+```
+
+**The prior.** The log of the Laplace density, summed over the allele effects:
+
+```{r prior-function}
+Laplace_prior <- function(beta_j, b) {
+  sum(-log(2 * b) - abs(beta_j) / b)
+}
+```
+
+**The posterior.** By Bayes' rule, log posterior = log likelihood + log prior (+ constant). The prior is applied to the allele effects only:
+
+```{r posterior-function}
+log_posterior <- function(parameters, Y, X, sigma2, b, penalised) {
+  beta <- parameters[-1]                       # drop the intercept
+  likelihood_linear(Y, X, parameters, sigma2) + Laplace_prior(beta[penalised], b)
+}
+```
+
+### Seeing it: likelihood, prior and posterior as contour plots
+
+With only two allele effects, we can draw each of the three ingredients as a "map" over all possible pairs $(\beta_{\text{DQB1*03:01}}, \beta_{\text{DQA1*05:05}})$. Each contour line joins points of equal height, like the contour lines of a hill on a map; the top of the hill is where the function is largest. To draw the maps, we hold the intercept and the covariate effects at their OLS values and vary only the two allele effects.
+
+```{r contour-grid}
+b_demo <- 0.03                                     # prior scale used for the picture
+grid_dqb <- seq(-0.25, 0.05, length.out = 151)
+grid_dqa <- seq(-0.10, 0.12, length.out = 151)
+
+j_dqb <- which(colnames(X) == focus[1]) + 1        # +1 for the intercept
+j_dqa <- which(colnames(X) == focus[2]) + 1
+
+surface <- function(fun) {
+  outer(grid_dqb, grid_dqa, Vectorize(function(b1, b2) {
+    par <- beta_ols
+    par[j_dqb] <- b1
+    par[j_dqa] <- b2
+    fun(par)
+  }))
+}
+
+ll_surf    <- surface(function(par) likelihood_linear(Y, X, par, sigma2))
+prior_surf <- surface(function(par) Laplace_prior(par[c(j_dqb, j_dqa)], b_demo))
+post_surf  <- ll_surf + prior_surf
+
+# MAP: the top of the posterior hill (all parameters optimised, see below)
+map_demo <- optim(beta_ols, log_posterior, Y = Y, X = X, sigma2 = sigma2,
+                  b = b_demo, penalised = penalised, method = "BFGS",
+                  control = list(fnscale = -1, maxit = 20000, reltol = 1e-14))$par
+```
+
+```{r contour-plot, fig.width = 12, fig.height = 4.3}
+draw_contour <- function(surf, main, levels = c(0.5, 2, 4.5, 8, 12.5, 18)) {
+  contour(grid_dqb, grid_dqa, max(surf) - surf, levels = levels,
+          drawlabels = FALSE, col = "grey30",
+          xlab = "beta  DQB1*03:01", ylab = "beta  DQA1*05:05", main = main)
+  abline(h = 0, v = 0, col = "grey70", lty = 3)
+}
+
+par(mfrow = c(1, 3))
+
+draw_contour(ll_surf, "Log-likelihood")
+points(beta_ols[j_dqb], beta_ols[j_dqa], pch = 19, col = "#2166AC", cex = 1.4)
+legend("topright", legend = "MLE (= OLS)", pch = 19, col = "#2166AC", bty = "n")
+
+draw_contour(prior_surf, paste0("Log-prior: Laplace, b = ", b_demo))
+points(0, 0, pch = 17, col = "#B2182B", cex = 1.4)
+
+draw_contour(post_surf, "Log-posterior = likelihood + prior")
+points(beta_ols[j_dqb], beta_ols[j_dqa], pch = 19, col = "#2166AC", cex = 1.4)
+points(map_demo[j_dqb], map_demo[j_dqa], pch = 18, col = "#B2182B", cex = 2)
+legend("topright", legend = c("MLE", "MAP"), pch = c(19, 18),
+       col = c("#2166AC", "#B2182B"), bty = "n")
+
+par(mfrow = c(1, 1))
+```
+
+How to read the three panels:
+
+- **Log-likelihood (left).** The contours are **tilted ellipses**. The tilt is the LD between the two alleles: we can trade a bit more of one effect for a bit less of the other and fit the data almost as well. The top of the hill is the MLE (blue), which is the same as the OLS estimate from the joint model above.
+- **Log-prior (middle).** The Laplace prior gives **diamond-shaped** contours centred on $(0, 0)$, because it penalises $|\beta_1| + |\beta_2|$. The diamond has sharp corners on the axes, where one of the two effects is exactly zero.
+- **Log-posterior (right).** Adding the two together pulls the hill towards zero. Because of the diamond's corners, the top of the posterior hill, the MAP (red), lands **on the horizontal axis**: DQA1\*05:05 is set to (almost exactly) zero, while DQB1\*03:01 keeps most of its effect. This is how the lasso **selects** variables.
+
+**Maximising.** `optim()` minimises by default, and `fnscale = -1` makes it maximise instead. We start from the OLS estimates:
+
+```{r fit-map}
+fit_map <- function(Y, X, sigma2, b, penalised) {
+  opt <- optim(coef(lm(Y ~ X)), log_posterior,
+               Y = Y, X = X, sigma2 = sigma2, b = b, penalised = penalised,
+               method = "BFGS",
+               control = list(fnscale = -1, maxit = 20000, reltol = 1e-14))
+  setNames(opt$par, c("(Intercept)", colnames(X)))
+}
+```
+
+As a sanity check, maximising the likelihood alone (no prior) should reproduce `lm()`:
+
+```{r mle-check}
+opt_mle <- optim(c(mean(Y), rep(0, ncol(X))), likelihood_linear,
+                 Y = Y, X = X, sigma2 = sigma2,
+                 method = "BFGS", control = list(fnscale = -1, maxit = 1000))
+mle <- setNames(opt_mle$par, c("(Intercept)", colnames(X)))
+
+round(cbind(optim = mle, lm = coef(lm(Y ~ X))), 3)
+```
+
+**Changing the prior width.** A smaller $b$ gives a narrower prior around zero, i.e. a stronger belief that allele effects are small:
+
+```{r vary-b}
+b_values <- c(1, 0.1, 0.03, 0.01, 0.003)
+
+map_two <- sapply(b_values, function(b) fit_map(Y, X, sigma2, b, penalised)[focus])
+colnames(map_two) <- paste0("b = ", b_values)
+
+tab <- cbind(MLE = mle[focus], map_two)
+rownames(tab) <- allele_label(focus)
+round(tab, 3)
+```
+
+As $b$ shrinks, both effects are pulled towards zero, but not at the same speed. DQA1\*05:05, the passenger, is set to zero first (already at $b = 0.03$), while DQB1\*03:01 keeps most of its effect until the prior becomes very strong. So the model keeps the allele that explains the signal better, just as the joint model suggested. With a very small $b$, the prior overwhelms the data and every effect is shrunk to (nearly) zero.
+
+::: {.highbox}
+**Note.** The Laplace log-prior has a kink at $\beta_j = 0$. The exact posterior mode can therefore be *exactly* zero (that is how the lasso selects variables), but a gradient method like BFGS only gets close to it (e.g. `1e-4`). Values that small should be read as zero.
+:::
+## The joint model with all alleles in `brms`
+
+Writing the posterior by hand shows what is going on, but it only worked for two alleles. In practice it is easier to use [`brms`](https://paul-buerkner.github.io/brms/), which turns a formula plus priors into a Stan model. Stan then **samples** from the full posterior with Hamiltonian Monte Carlo, instead of returning only the mode. This lets us fit the model we actually want: **all `r length(alleles)` alleles at once**, each with the double-exponential (Laplace) prior.
+
+The model is the one we wrote down above:
+
+- **Allele effects**: `double_exponential(0, b)`, Stan's name for the Laplace distribution, with scale $b$. We use $b = 0.03$, i.e. we expect most allele effects to be within a few hundredths of a log10 unit of zero.
+- **Intercept and covariates** (age, sex, BMI): flat priors, which is the `brms` default for class `b`, so they are not shrunk. We write `0 + Intercept` so that the intercept is treated as an ordinary coefficient; otherwise `brms` would centre the predictors and give the intercept its own default prior.
+- **Residual SD** $\sigma$: estimated together with everything else, using the `brms` default prior.
+
+First we prepare the data. `brms` needs syntactically clean variable names, so we rename the alleles from `HLA_DQB1.03.01` to `DQB1_03_01`, and we scale age and BMI as before:
+
+```{r brms-data}
+library(brms)
+library(bayesplot)
+
+dd_all <- na.omit(dat[, c("viral_load", "AGE", "SEX", "BMI", alleles)])
+
+allele_names <- sub("^HLA_([A-Z0-9]+)\\.(\\d+)\\.(\\d+)$", "\\1_\\2_\\3", alleles)
+names(dd_all)[match(alleles, names(dd_all))] <- allele_names
+
+dd_all$AGE <- as.numeric(scale(dd_all$AGE))
+dd_all$BMI <- as.numeric(scale(dd_all$BMI))
+dd_all$SEX <- as.integer(dd_all$SEX == "Male")   # 1 = male, 0 = female
+```
+
+Now we write the formula and the priors, and fit the model:
+
+```{r brms-fit, results = "hide"}
+form_all <- bf(reformulate(c("0", "Intercept", "AGE", "SEX", "BMI", allele_names),
+                           response = "viral_load"))
+
+b <- 0.03
+priors_all <- set_prior(sprintf("double_exponential(0, %g)", b),
+                        class = "b", coef = allele_names)
+
+fit_all <- brm(form_all, data = dd_all, family = gaussian(), prior = priors_all,
+               chains = 4, iter = 2000, cores = 4, seed = 1, refresh = 0)
+```
+
+::: {.highbox}
+**Code tips:**
+
+- `get_prior(form_all, data = dd_all)` lists every parameter in the model and its default prior. It is a good way to check the names to use in `set_prior()`.
+- `set_prior()` accepts a vector in `coef`, so one line gives all `r length(alleles)` alleles the same prior.
+- The first call to `brm()` compiles the model to C++, which takes a minute or two. Sampling itself is quick.
+:::
+
+Before looking at the results, we check that the four chains agree with each other. $\hat R$ ("R-hat") compares the chains: values close to 1 (below 1.01) mean they have converged to the same posterior.
+
+```{r brms-rhat}
+max(brms::rhat(fit_all))   # brms:: because bayesplot also has a rhat() function
+```
+
+### Results
+
+The posterior summary gives, for each coefficient, the posterior mean (`Estimate`), the posterior SD (`Est.Error`) and a 95% **credible interval**:
+
+```{r brms-summary}
+post_summary <- fixef(fit_all)
+round(post_summary[allele_names, ], 3)
+```
+
+We can also compute, for each allele, the posterior probability that it **lowers** viral load, $P(\beta_j < 0 \mid \text{data})$:
+
+```{r brms-prob}
+draws  <- as_draws_df(fit_all)
+p_neg  <- colMeans(as.matrix(draws[, paste0("b_", allele_names)]) < 0)
+names(p_neg) <- allele_label(alleles)
+round(sort(p_neg, decreasing = TRUE)[1:5], 3)
+```
+
+### Plotting the posterior with `bayesplot`
+
+A table of `r length(alleles)` posteriors is as hard to read as the table of `r length(alleles)` marginal tests. [`bayesplot`](https://mc-stan.org/bayesplot/) draws them all in one picture, much like a forest plot. `mcmc_areas()` shows the **full posterior distribution** of each allele effect: the curve is the posterior density, the vertical line is the posterior median, and the shaded area is the 95% credible interval.
+
+```{r brms-plot, fig.width = 7, fig.height = 11}
+post_alleles <- as.matrix(draws[, paste0("b_", allele_names)])
+colnames(post_alleles) <- allele_label(alleles)
+
+# order the alleles by their posterior median, so the strongest effects sit at the ends
+ord <- order(apply(post_alleles, 2, median))
+
+color_scheme_set("blue")
+mcmc_areas(post_alleles[, ord], prob = 0.95) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  labs(x = "Change in log10 viral load per allele copy",
+       title = "Joint model with all alleles (Laplace prior, b = 0.03)",
+       subtitle = "Curve: posterior density; line: median; shaded: 95% credible interval")
+```
+
+How to read these results:
+
+- **DQB1\*03:01 stands out.** Its posterior is clearly below zero (mean `r sprintf('%.3f', post_summary["DQB1_03_01", "Estimate"])`, 95% CrI `r sprintf('%.3f', post_summary["DQB1_03_01", "Q2.5"])` to `r sprintf('%.3f', post_summary["DQB1_03_01", "Q97.5"])`), and $P(\beta < 0 \mid \text{data}) =$ `r sprintf('%.3f', p_neg["DQB1*03:01"])`. Remember that in the ordinary joint model with all alleles (`full` above), its standard error was so large that it was not even significant. The prior has stabilised the estimate.
+- **DQA1\*05:05 is shrunk to zero.** Its posterior sits right on top of zero (mean `r sprintf('%.3f', post_summary["DQA1_05_05", "Estimate"])`), exactly as in the two-allele example: once DQB1\*03:01 is in the model, its passenger adds nothing.
+- **Most other alleles are pulled towards zero.** Many of the class II alleles that were "significant" in the marginal scan (for example DQA1\*05:05, DRB1\*15:01 or DQB1\*06:02) now have credible intervals that include zero: in the marginal forest plot they were largely tagging the same few signals through LD. The few alleles whose 95% credible interval still excludes zero, such as A\*02:01 or B\*44:03, are candidates for smaller, independent effects worth following up.
+
+::: {.highbox}
+**Credible interval vs confidence interval.** A 95% *credible* interval has the direct interpretation we often (wrongly) give to a confidence interval: given the data and the prior, there is a 95% probability that the true effect lies inside it. The price is that it depends on the prior we chose, so with a different $b$ the intervals would change.
+:::

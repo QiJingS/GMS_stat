@@ -1,0 +1,377 @@
+---
+title: "Logistic regression"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+---
+
+```{css, echo=FALSE}
+.highbox {
+  color: #023103;
+  background-color: #E6F6E6;
+  border: 1px solid #E6F6E6;
+  padding: 12px 15px;
+  border-radius: 4px;
+  text-align: left;
+  margin: 20px 0;
+}
+```
+
+```{r klippy, echo=FALSE, include=TRUE}
+klippy::klippy(position = c('top', 'right'))
+```
+
+```{r echo=FALSE, warning=FALSE}
+library(knitr)
+library(DT)
+```
+
+```{r load-data, echo=FALSE}
+hcv_dataset <- readRDS("hcv_dataset.rds")
+
+HLA_alleles <- hcv_dataset$HLA        # HLA genotypes: copies (0/1/2) of each allele
+pheno       <- hcv_dataset$phenotype  # outcomes: viral load, cirrhosis, fibrosis
+covar       <- hcv_dataset$covariate  # patient characteristics: age, sex, BMI, ...
+```
+
+Welcome back to the regression sessions! In this tutorial, we will learn **logistic regression**. Before we get to the terminology, let's start with the biological question:
+
+<div class="highbox">
+<strong>Question:</strong> Is <strong>cirrhosis</strong> associated with an HLA allele? Let's look at HLA-DQB1\*03:01 again.
+</div>
+
+## Why not linear regression?
+
+::: {.highbox}
+**Question:** Can we use linear regression to analyse the association between cirrhosis and an HLA allele?
+:::
+
+Cirrhosis is **binary**: each patient either has it (1) or doesn't (0). Let's try fitting a straight line anyway and see what happens.
+
+```{r dat2}
+## Recode cirrhosis from "No"/"Yes" to 0/1, so that R can treat it as a number
+pheno$cirrhosis <- ifelse(pheno$cirrhosis == "No", 0, 1)
+
+dat2 <- data.frame(
+  cirrhosis = pheno$cirrhosis,                  # 0 = no, 1 = yes
+  dq        = HLA_alleles$HLA_DQB1.03.01,       # copies of DQB1*03:01
+  age       = covar$AGE
+)
+dat2 <- na.omit(dat2)                           # drop patients with missing age
+
+table(DQB1_03_01 = dat2$dq, cirrhosis = dat2$cirrhosis)   # counts in each group
+```
+
+```{r linear-fit-plot, echo=FALSE, fig.width=5, fig.height=4}
+set.seed(1)
+fit_lin <- lm(cirrhosis ~ dq, data = dat2)
+
+plot(jitter(dat2$dq, amount = 0.15), jitter(dat2$cirrhosis, amount = 0.05),
+     pch = 16, col = adjustcolor("grey40", 0.15),
+     xaxt = "n", yaxt = "n",
+     xlab = "Copies of DQB1*03:01", ylab = "Cirrhosis",
+     main = "A straight line through yes/no data")
+axis(1, at = 0:2)
+axis(2, at = c(0, 1), labels = c("No (0)", "Yes (1)"), las = 1)
+abline(fit_lin, col = "blue", lwd = 3)
+```
+
+The points sit on just two rows, 0 and 1, and the line runs between them. What the line is really predicting is the **probability** of cirrhosis: the average of the 0s and 1s in each group. That sounds reasonable, but there are two problems.
+
+**Problem 1: the line can go below 0 or above 1.** A probability must be between 0 and 1, but a straight line keeps going forever. This is easy to see with a continuous predictor such as age:
+
+```{r linear-age-plot, echo=FALSE, fig.width=5, fig.height=4}
+fit_age <- lm(cirrhosis ~ age, data = dat2)
+
+plot(dat2$age, jitter(dat2$cirrhosis, amount = 0.05),
+     pch = 16, col = adjustcolor("grey40", 0.15),
+     xlim = c(0, 100), ylim = c(-0.4, 1.4), yaxt = "n",
+     xlab = "Age (years)", ylab = "Predicted probability of cirrhosis",
+     main = "A straight line ignores the 0–1 limits")
+axis(2, at = c(0, 0.5, 1), las = 1)
+abline(h = c(0, 1), col = "red", lty = 2)
+abline(fit_age, col = "blue", lwd = 3)
+```
+
+The line already predicts a negative "probability" for the youngest patients in our data (`r sprintf('%.2f', min(predict(fit_age)))`), and if we extended it to very old patients it would eventually go above 1. Neither makes sense.
+
+**Problem 2: the assumptions from last session are broken.** Remember that linear regression assumes the residuals are normally distributed with equal spread. With a 0/1 outcome, each patient's residual can only take one of two values (1 minus the line, or 0 minus the line), so the residuals can't be normal:
+
+```{r linear-qq, echo=FALSE, fig.width=5, fig.height=4}
+qqnorm(resid(fit_lin), pch = 16, col = adjustcolor("grey30", 0.3),
+       main = "QQ plot of residuals: far from a straight line")
+qqline(resid(fit_lin), col = "red", lwd = 2)
+```
+
+## From probability to log-odds
+
+So we need a transformation. The linear part $\beta_0 + \beta_1 x$ can take any value in $(-\infty, +\infty)$, but a probability can only live between 0 and 1, so we cannot simply set $p = \beta_0 + \beta_1 x$.
+
+Let's use the **odds** instead of the probability. Say the probability of cirrhosis is $p$, which lies in $(0, 1)$. The odds are defined as *happens / doesn't happen*:
+
+$$
+\text{odds} = \frac{p}{1 - p}
+$$
+
+For example, if the probability of cirrhosis is $p = 0.2$, the probability of no cirrhosis is 0.8, so the odds are $0.2/0.8 = 1/4$ ("1 to 4"). If $p = 0.8$, the odds are $0.8/0.2 = 4$.
+
+The odds get rid of the upper limit of 1, since they range from 0 to $+\infty$, but they still cannot be negative. So we go one step further and take the log. The **log-odds** range over $(-\infty, +\infty)$, which matches the linear part perfectly.
+
+So we can write the **logistic regression** model as:
+
+$$
+\log(\text{odds}) = \log\left(\frac{p}{1-p}\right) = \beta_0 + \beta_1 x
+$$
+
+The function $\log\left(\frac{p}{1-p}\right)$ is called the **logit** of $p$.
+
+::: {.highbox}
+**Where is the error term $\varepsilon$?** In linear regression we need $\varepsilon$ because the outcome $y$ is continuous and scatters around the line. In logistic regression, the outcome is just 0 or 1, and the randomness already comes from the outcome itself: given $p$, each patient either develops cirrhosis or not, like flipping a biased coin, $Y \sim \text{Bernoulli}(p)$. So the log-odds are modelled directly as $\beta_0 + \beta_1 x$, without an extra error term.
+:::
+
+### Back to the probability: the sigmoid function
+
+Now we want to go back from the log-odds to the probability $p$. Let's write $z = \beta_0 + \beta_1 x$. Taking the exponential of both sides:
+
+$$
+\frac{p}{1-p} = e^{z}
+$$
+
+Multiply both sides by $(1-p)$ and collect the terms with $p$ on one side:
+
+$$
+p = e^{z} - p\,e^{z} \quad\Rightarrow\quad p\,(1 + e^{z}) = e^{z} \quad\Rightarrow\quad p = \frac{e^{z}}{1 + e^{z}}
+$$
+
+Dividing both the numerator and the denominator by $e^{z}$ gives:
+
+$$
+p = \frac{1}{1 + e^{-z}}
+$$
+
+This is the **sigmoid function** (also called the logistic function, which gives logistic regression its name). It takes any number $z$ from $-\infty$ to $+\infty$ and squeezes it into a probability between 0 and 1, which is exactly what we wanted. In the plot below, the red part is where $z$ is positive ($p > 0.5$), and the blue part is where $z$ is negative ($p < 0.5$):
+
+```{r sigmoid, fig.width=5, fig.height=4}
+sigmoid <- function(z) {
+  1 / (1 + exp(-z))
+}
+
+z <- seq(-6, 6, by = 0.01)
+p <- sigmoid(z)
+
+plot(z, p, type = "n", ylim = c(0, 1),
+     xlab = "z (log-odds)", ylab = "p",
+     main = "Sigmoid function")
+lines(z[z <= 0], p[z <= 0], col = "steelblue", lwd = 3)
+lines(z[z >= 0], p[z >= 0], col = "firebrick", lwd = 3)
+abline(h = 0.5, v = 0, lty = 2, col = "grey50")
+abline(h = c(0, 1), lty = 3, col = "grey70")
+points(0, 0.5, pch = 19)
+text(-3.5, 0.85, "z < 0  ->  p < 0.5", col = "steelblue")
+text( 3.5, 0.15, "z > 0  ->  p > 0.5", col = "firebrick")
+```
+
+- When $z = 0$, $e^{-z} = 1$, so $p = 1/2$. This makes sense: a log-odds of 0 means odds of 1, i.e. cirrhosis and no cirrhosis are equally likely.
+- When $z$ is positive, $e^{-z} < 1$, so $p > 0.5$. As $z \to +\infty$, $e^{-z} \to 0$ and $p$ approaches 1.
+- When $z$ is negative, $e^{-z} > 1$, so $p < 0.5$. As $z \to -\infty$, $e^{-z}$ blows up and $p$ approaches 0.
+
+So the curve never actually touches 0 or 1; it just gets closer and closer.
+
+### What does $\beta_1$ do?
+
+The plot below shows $p = \text{sigmoid}(\beta_1 x)$ for a few values of $\beta_1$ (with $\beta_0 = 0$):
+
+```{r beta1-effect, fig.width=5, fig.height=4}
+x_grid <- seq(-6, 6, by = 0.01)
+betas  <- c(0.5, 1, 3, -1)
+cols   <- c("orange", "black", "darkgreen", "purple")
+
+plot(NA, xlim = range(x_grid), ylim = c(0, 1),
+     xlab = "x", ylab = "p", main = expression("Effect of " * beta[1]))
+for (i in seq_along(betas)) {
+  lines(x_grid, sigmoid(betas[i] * x_grid), col = cols[i], lwd = 2)
+}
+abline(h = 0.5, lty = 2, col = "grey50")
+legend("topleft", legend = paste("beta1 =", betas),
+       col = cols, lwd = 2, bty = "n")
+```
+
+A larger $\beta_1$ makes the S-curve steeper, so $x$ has a stronger effect on the risk; a smaller $\beta_1$ makes it flatter. A negative $\beta_1$ flips the curve, so the risk goes **down** as $x$ goes up. ($\beta_0$ shifts the whole curve left or right.)
+
+### Interpreting $\beta_1$: the odds ratio
+
+Because the model is linear on the log-odds scale, increasing $x$ by one unit **adds** $\beta_1$ to the log-odds. Going back to the odds scale by taking the exponential, this means the odds are **multiplied** by $e^{\beta_1}$:
+
+$$
+\frac{\text{odds}(x+1)}{\text{odds}(x)} = \frac{e^{\beta_0 + \beta_1 (x+1)}}{e^{\beta_0 + \beta_1 x}} = e^{\beta_1}
+$$
+
+This $e^{\beta_1}$ is the **odds ratio (OR)** that we often see in clinical papers:
+
+- $\beta_1 = 0$ gives OR $= 1$: no association.
+- $\beta_1 > 0$ gives OR $> 1$: higher $x$, higher odds. For example, $\beta_1 = 0.7$ gives $e^{0.7} \approx 2$, so each one-unit increase in $x$ doubles the odds of cirrhosis.
+- $\beta_1 < 0$ gives OR $< 1$: higher $x$, lower odds.
+
+## How to estimate $\beta$: maximum likelihood estimation
+
+In the last session, we used ordinary least squares (OLS) to estimate $\beta$. OLS doesn't work here, because we don't have a continuous $y$ to draw a line through. In linear regression, each patient has an observed value $y_i$, and we find the line that minimises the squared distances $\sum (y_i - \hat{y}_i)^2$. In logistic regression, what we model is the log-odds, $\log\left(\frac{p}{1-p}\right)$, but we never observe it: for each patient we only observe whether they have cirrhosis ($y_i = 1$) or not ($y_i = 0$). If we try to compute the "observed" log-odds for one patient, we get $\log(1/0) = +\infty$ or $\log(0/1) = -\infty$, so there is nothing sensible to fit a line to.
+
+So we need a different idea. Instead of asking "which line is closest to the data?", we ask: **"which values of $\beta$ make the data we actually observed the most likely?"** This is the idea of **maximum likelihood estimation (MLE)**.
+
+### A simple example first
+
+Let's forget about $x$ for a moment. Suppose we have 10 patients, and 3 of them have cirrhosis. We assume every patient has the same probability $p$ of cirrhosis, and we want to estimate $p$.
+
+For one patient, the probability of what we observed can be written in one compact formula:
+
+$$
+P(Y_i = y_i) = p^{y_i}(1-p)^{1-y_i}
+$$
+
+This looks a bit strange at first, but just plug in the two cases: if $y_i = 1$ (cirrhosis), it becomes $p^1(1-p)^0 = p$; if $y_i = 0$ (no cirrhosis), it becomes $p^0(1-p)^1 = 1 - p$. So it is just a neat way of writing both cases together.
+
+If the patients are independent, the probability of observing the whole dataset is the product over all patients. We call this the **likelihood**, and treat it as a function of the unknown $p$:
+
+$$
+L(p) = \prod_{i=1}^{10} p^{y_i}(1-p)^{1-y_i} = p^{3}(1-p)^{7}
+$$
+
+Now we can try different values of $p$ and see which one gives the highest likelihood:
+
+| $p$ | $L(p) = p^3(1-p)^7$ |
+|---|---|
+| 0.1 | $\approx 0.00048$ |
+| 0.3 | $\approx 0.00222$ |
+| 0.8 | $\approx 0.0000066$ |
+
+So $p = 0.3$ makes our data far more likely than $p = 0.8$ does, which makes sense.
+
+Multiplying many small probabilities together quickly gives tiny numbers, so in practice we work with the **log-likelihood** instead. Since log is an increasing function, the $p$ that maximises $\log L$ also maximises $L$, and the log turns the product into a sum:
+
+$$
+\ell(p) = \log L(p) = 3\log(p) + 7\log(1-p)
+$$
+
+To find the maximum, we set the derivative to 0:
+
+$$
+\frac{d\ell}{dp} = \frac{3}{p} - \frac{7}{1-p} = 0 \quad\Rightarrow\quad 3(1-p) = 7p \quad\Rightarrow\quad \hat{p} = \frac{3}{10} = 0.3
+$$
+
+The MLE is exactly the proportion of cirrhosis in our sample, which is what our intuition would say anyway. We can see it in a plot:
+
+```{r likelihood-simple, fig.width=10, fig.height=4}
+p_grid <- seq(0.001, 0.999, by = 0.001)
+lik    <- p_grid^3 * (1 - p_grid)^7
+loglik <- 3 * log(p_grid) + 7 * log(1 - p_grid)
+
+par(mfrow = c(1, 2))
+plot(p_grid, lik, type = "l", lwd = 2,
+     xlab = "p", ylab = "L(p)", main = "Likelihood")
+abline(v = 0.3, lty = 2, col = "firebrick")
+
+plot(p_grid, loglik, type = "l", lwd = 2, ylim = c(-30, -5),
+     xlab = "p", ylab = "log L(p)", main = "Log-likelihood")
+abline(v = 0.3, lty = 2, col = "firebrick")
+
+```
+
+Both curves peak at the same place, $p = 0.3$.
+
+### Back to logistic regression
+
+Now let's bring $x$ back. The only difference is that patients no longer share the same $p$. Each patient has their own probability, which depends on their $x_i$ through the sigmoid function:
+
+$$
+p_i = \frac{1}{1 + e^{-(\beta_0 + \beta_1 x_i)}}
+$$
+
+The likelihood has exactly the same form as before, but now it is a function of $\beta_0$ and $\beta_1$:
+
+$$
+L(\beta_0, \beta_1) = \prod_{i=1}^{n} p_i^{y_i}(1-p_i)^{1-y_i}
+$$
+
+and the log-likelihood is:
+
+$$
+\ell(\beta_0, \beta_1) = \sum_{i=1}^{n} \Big[ y_i \log(p_i) + (1 - y_i)\log(1 - p_i) \Big]
+$$
+
+Let's read this formula patient by patient. For a patient with cirrhosis ($y_i = 1$), only $\log(p_i)$ is left, so the model is rewarded for giving them a high predicted risk. For a patient without cirrhosis ($y_i = 0$), only $\log(1 - p_i)$ is left, so the model is rewarded for giving them a low predicted risk. The MLE of $\beta$ is the pair of values that does the best job on both groups at the same time.
+
+
+Unlike the simple example, if we set the derivatives to 0 here, we cannot solve the equations by hand, because $\beta$ is buried inside the sigmoid function. There is no closed-form formula like the one we had for OLS, $\hat\beta_1 = \text{Cov}(x, y) / \text{Var}(x)$. Instead, the computer finds the maximum numerically: it starts with a guess for $\beta$, checks which direction makes the log-likelihood go up, takes a step that way, and repeats until it can't go any higher. The algorithm R uses in `glm()` is called **iteratively reweighted least squares (IRLS)**, a version of Newton–Raphson. Luckily, the log-likelihood of logistic regression is concave (it has a single peak, with no local bumps), so the algorithm always finds the same answer.
+
+### Let's try it in R
+
+We simulate some data where we know the true values, $\beta_0 = -1$ and $\beta_1 = 1.5$. Then we write our own log-likelihood function, maximise it with `optim()`, and compare the result with `glm()`.
+
+```{r mle-logistic}
+set.seed(42)
+
+n  <- 200
+x  <- rnorm(n)                       # e.g. a standardised risk factor
+p  <- sigmoid(-1 + 1.5 * x)          # true probabilities
+y  <- rbinom(n, size = 1, prob = p)  # observed cirrhosis (0/1)
+
+## negative log-likelihood (optim() minimises by default)
+neg_loglik <- function(beta) {
+  p_i <- sigmoid(beta[1] + beta[2] * x)
+  -sum(y * log(p_i) + (1 - y) * log(1 - p_i))
+}
+
+## our own MLE, starting from beta = (0, 0)
+fit_optim <- optim(par = c(0, 0), fn = neg_loglik, method = "BFGS")
+fit_optim$par
+
+## R's built-in logistic regression
+fit_glm <- glm(y ~ x, family = binomial)
+coef(fit_glm)
+```
+
+The two sets of estimates agree to several decimal places, and both are close to the true values $-1$ and $1.5$. So `glm()` is not doing anything magical: it is just maximising the log-likelihood we wrote down.
+
+We can also see what "maximising" looks like. Let's fix $\beta_0$ at its estimate and plot the log-likelihood as we vary $\beta_1$:
+
+```{r loglik-beta1, fig.width=6, fig.height=4}
+b0_hat  <- coef(fit_glm)[1]
+b1_grid <- seq(-1, 4, by = 0.01)
+ll      <- sapply(b1_grid, function(b1) -neg_loglik(c(b0_hat, b1)))
+
+plot(b1_grid, ll, type = "l", lwd = 2,
+     xlab = expression(beta[1]), ylab = "log-likelihood",
+     main = expression("Log-likelihood as a function of " * beta[1]))
+abline(v = coef(fit_glm)[2], lty = 2, col = "firebrick")
+abline(v = 1.5, lty = 3, col = "grey40")
+legend("bottomright", legend = c("MLE", "true value"),
+       lty = c(2, 3), col = c("firebrick", "grey40"), bty = "n")
+```
+
+The curve has a single peak, and the top of the hill is our estimate $\hat\beta_1$. The shape of this hill also tells us how certain we are. A sharp, narrow peak means only a small range of $\beta_1$ values fit the data well, so the standard error is small. A flat, wide peak means many values fit almost equally well, so the standard error is large. This curvature is exactly what `glm()` uses to compute the standard errors you see in `summary(fit_glm)`.
+
+::: {.highbox}
+**Connection to OLS.** Maximum likelihood is not new to us: OLS is a special case of it. In linear regression we assumed $y_i = \beta_0 + \beta_1 x_i + \varepsilon_i$ with normally distributed errors. Under that assumption, the log-likelihood of the data is, apart from constants, $-\frac{1}{2\sigma^2}\sum_i (y_i - \beta_0 - \beta_1 x_i)^2$, so making the likelihood as large as possible is exactly the same as making the SSE as small as possible. In other words, the OLS line we found last session *was* the maximum likelihood estimate. Logistic regression keeps the same recipe and changes only one ingredient: the outcome follows a Bernoulli distribution instead of a normal one, so the log-likelihood becomes the sum of $y_i \log p_i + (1 - y_i)\log(1 - p_i)$ instead of a sum of squared residuals. Both models belong to the same family, **generalised linear models (GLMs)**, which is why R fits them with `lm()` and `glm()`, and why the output of the two looks so similar.
+:::
+
+
+## Back to our question: DQB1\*03:01 and cirrhosis
+
+Now we can answer the question we started with. We fit a logistic regression of cirrhosis on the number of DQB1\*03:01 copies, adjusting for age (a strong risk factor for cirrhosis):
+
+```{r hcv-glm}
+fit_dq <- glm(cirrhosis ~ dq + age, data = dat2, family = binomial)
+summary(fit_dq)$coefficients
+
+or_dq <- exp(cbind(OR = coef(fit_dq), confint(fit_dq)))
+round(or_dq, 3)
+```
+
+Each extra copy of DQB1\*03:01 multiplies the odds of cirrhosis by about `r sprintf('%.2f', or_dq["dq", "OR"])` (95% CI `r sprintf('%.2f', or_dq["dq", 2])` to `r sprintf('%.2f', or_dq["dq", 3])`), i.e. about `r round(100 * (1 - or_dq["dq", "OR"]))`% lower odds per copy. The CI does not include 1 and $p =$ `r sprintf('%.3f', summary(fit_dq)$coefficients["dq", 4])`, so the allele is associated with a lower risk of cirrhosis, but the evidence is much weaker than for viral load, and it would not survive a Bonferroni correction for testing all `r ncol(HLA_alleles) - 1` alleles.
+
+::: {.highbox}
+**Question:** So far we have looked at one allele at a time. But the HLA region contains many alleles, and some of them are strongly correlated with each other. If several alleles look associated, how do we tell which one is really driving the signal?
+:::
